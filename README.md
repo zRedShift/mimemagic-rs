@@ -1,1 +1,1 @@
-# mime_magic
+# mimemagic

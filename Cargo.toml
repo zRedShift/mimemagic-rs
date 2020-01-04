@@ -1,7 +1,17 @@
 [package]
-name = "mime_magic"
+name = "mimemagic"
 version = "0.1.0"
+description = "Determines the file's MIME type by inspecting its contents & extension"
 authors = ["Ronen Ulanovsky <ronen.ulanovsky.5@gmail.com>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/zRedShift/mimemagic-rs"
+documentation = "https://docs.rs/mimemagic"
+homepage = "https://github.com/zRedShift/mimemagic-rs"
+keywords = ["mime", "extension", "media-types"]
+categories = ["filesystem", "command-line-utilities"]
+exclude = ["shared-mime-info/*", "!shared-mime-info/freedesktop.org.xml.in"]
+
 edition = "2018"
 build = "build.rs"
 
