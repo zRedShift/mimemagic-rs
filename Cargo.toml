@@ -13,9 +13,8 @@ categories = ["filesystem", "command-line-utilities"]
 exclude = ["shared-mime-info/*", "!shared-mime-info/freedesktop.org.xml.in"]
 
 edition = "2018"
-build = "build.rs"
 
-[build-dependencies]
-quick-xml = "^0.17.2"
+[workspace]
+members = ["mimegen"]
 
 [dependencies]
