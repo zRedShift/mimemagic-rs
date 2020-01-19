@@ -1,9 +1,11 @@
 use quick_xml::Error as XmlError;
-use std::error::Error as StdError;
-use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::io::Error as IoError;
-use std::num::ParseIntError;
-use std::str::ParseBoolError;
+use std::{
+    error::Error as StdError,
+    fmt::{Display, Formatter, Result as FmtResult},
+    io::Error as IoError,
+    num::ParseIntError,
+    str::ParseBoolError,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

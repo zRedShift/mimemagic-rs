@@ -1,13 +1,13 @@
-use crate::errors::Error::MissingElem;
-use errors::{Error, Result};
-use quick_xml::events::attributes::Attributes;
-use quick_xml::events::Event;
-use quick_xml::Reader;
-use std::cmp::Ordering;
-use std::io::BufRead;
-use std::ops::RangeInclusive;
+use crate::error::Error::MissingElem;
+use error::{Error, Result};
+use quick_xml::{
+    events::{attributes::Attributes, Event},
+    Reader,
+};
+use std::convert::{TryFrom, TryInto};
+use std::{cmp::Ordering, io::BufRead, ops::RangeInclusive};
 
-pub mod errors;
+pub mod error;
 
 fn hex_to_val(c: u8) -> Option<u8> {
     match c {
@@ -134,20 +134,13 @@ fn extract_priority<R: BufRead>(reader: &mut Reader<R>, attributes: Attributes) 
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct MimeType {
     value: String,
     sep: usize,
 }
 
 impl MimeType {
-    fn from_owned(s: String) -> Result<Self> {
-        match s.as_bytes().iter().position(|&b| b == b'/') {
-            Some(sep) => Ok(Self { value: s, sep }),
-            None => Err(Error::InvalidType(s)),
-        }
-    }
-
     pub fn media(&self) -> &str {
         &self.value[..self.sep]
     }
@@ -157,7 +150,17 @@ impl MimeType {
     }
 }
 
-#[derive(Debug)]
+impl TryFrom<String> for MimeType {
+    type Error = Error;
+    fn try_from(s: String) -> Result<Self> {
+        match s.as_bytes().iter().position(|&b| b == b'/') {
+            Some(sep) => Ok(Self { value: s, sep }),
+            None => Err(Error::InvalidType(s)),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct Glob {
     pattern: String,
     weight: u8,
@@ -186,13 +189,13 @@ impl Glob {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Offset {
     Index(usize),
     Range(RangeInclusive<usize>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Match {
     offset: Offset,
     value: Vec<u8>,
@@ -207,7 +210,7 @@ impl Match {
                 return Ok((
                     unescape(&value),
                     if let Some(s) = mask { hex_to_bytes(s)? } else { vec![] },
-                ))
+                ));
             }
             "big16" => (2, false),
             "big32" => (4, false),
@@ -294,7 +297,7 @@ impl Match {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Magic {
     priority: u8,
     matches: Vec<Match>,
@@ -313,7 +316,7 @@ impl Magic {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Descriptor {
     None,
     File,
@@ -333,7 +336,7 @@ impl Descriptor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct TreeMatch {
     path: String,
     descriptor: Descriptor,
@@ -388,7 +391,7 @@ impl TreeMatch {
                 b"executable" => executable = attr.unescape_and_decode_value(reader)?.parse()?,
                 b"non-empty" => non_empty = attr.unescape_and_decode_value(reader)?.parse()?,
                 b"mimetype" => {
-                    mime_type = Some(MimeType::from_owned(attr.unescape_and_decode_value(reader)?)?)
+                    mime_type = Some(attr.unescape_and_decode_value(reader)?.try_into()?)
                 }
                 _ => {}
             };
@@ -400,7 +403,7 @@ impl TreeMatch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct TreeMagic {
     priority: u8,
     pub matches: Vec<TreeMatch>,
@@ -419,7 +422,7 @@ impl TreeMagic {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct RootXML {
     namespace_uri: String,
     local_name: String,
@@ -492,7 +495,7 @@ impl GenericIcon {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Entry {
     pub mime_type: MimeType,
     comment: String,
@@ -510,8 +513,7 @@ pub struct Entry {
 
 impl Entry {
     fn from_xml<R: BufRead>(reader: &mut Reader<R>, attributes: Attributes) -> Result<Self> {
-        let mime_type =
-            MimeType::from_owned(extract_single_attr(reader, attributes, "mime-type", "type")?)?;
+        let mime_type = extract_single_attr(reader, attributes, "mime-type", "type")?.try_into()?;
         let mut buf = vec![];
         let mut comment = None;
         let mut acronym = None;
@@ -557,15 +559,13 @@ impl Entry {
                     }
                     b"glob" => globs.push(Glob::from_xml(reader, e.attributes())?),
                     b"root-XML" => root_xmls.push(RootXML::from_xml(reader, e.attributes())?),
-                    b"alias" => aliases.push(MimeType::from_owned(extract_single_attr(
-                        reader,
-                        e.attributes(),
-                        "alias",
-                        "type",
-                    )?)?),
-                    b"sub-class-of" => sub_class_of.push(MimeType::from_owned(
-                        extract_single_attr(reader, e.attributes(), "sub-class-of", "type")?,
-                    )?),
+                    b"alias" => aliases.push(
+                        extract_single_attr(reader, e.attributes(), "alias", "type")?.try_into()?,
+                    ),
+                    b"sub-class-of" => sub_class_of.push(
+                        extract_single_attr(reader, e.attributes(), "sub-class-of", "type")?
+                            .try_into()?,
+                    ),
                     _ => {}
                 },
                 Event::End(_) => break,
@@ -592,7 +592,7 @@ impl Entry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct MimeInfo(pub Vec<Entry>);
 
 impl MimeInfo {
@@ -611,5 +611,352 @@ impl MimeInfo {
             buf.clear();
         }
         Ok(Self(entries))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_globs() {
+        let tests = [
+            (
+                br#"<glob pattern="[0-9][0-9][0-9].vdr"/>"#.as_ref(),
+                Glob { pattern: "[0-9][0-9][0-9].vdr".into(), weight: 50, case_sensitive: false },
+            ),
+            (
+                br#"<glob pattern="*.anim[1-9j]"/>"#,
+                Glob { pattern: "*.anim[1-9j]".into(), weight: 50, case_sensitive: false },
+            ),
+            (
+                br#"<glob weight="60" pattern="*.appimage"/>"#,
+                Glob { pattern: "*.appimage".into(), weight: 60, case_sensitive: false },
+            ),
+            (
+                br#"<glob pattern="*.C" case-sensitive="true"/>"#,
+                Glob { pattern: "*.C".into(), weight: 50, case_sensitive: true },
+            ),
+        ];
+        for test in tests.iter() {
+            let reader = &mut Reader::from_reader(test.0);
+            reader.trim_text(true);
+            let glob = match reader.read_event(&mut Vec::new()).unwrap() {
+                Event::Empty(e) => Glob::from_xml(reader, e.attributes()).unwrap(),
+                event => panic!("expected Event::Empty, found {:?}", event),
+            };
+            assert_eq!(glob, test.1);
+        }
+    }
+
+    #[test]
+    fn parse_magic() {
+        let tests = [
+            (
+                br#"<magic priority="60">
+                        <match type="little32" mask="0x8080ffff" value="0x0000081a" offset="0"/>
+                    </magic>"#
+                    .as_ref(),
+                Magic {
+                    priority: 60,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: vec![0x1a, 0x08, 0x00, 0x00],
+                        mask: vec![0xff, 0xff, 0x80, 0x80],
+                        matches: vec![],
+                    }],
+                },
+            ),
+            (
+                br#"<magic priority="50">
+                        <match type="string" value="ADIF" offset="0"/>
+                        <match type="big16" value="0xFFF0" mask="0xFFF6" offset="0"/>
+                    </magic>"#,
+                Magic {
+                    priority: 50,
+                    matches: vec![
+                        Match {
+                            offset: Offset::Index(0),
+                            value: b"ADIF".to_vec(),
+                            mask: vec![],
+                            matches: vec![],
+                        },
+                        Match {
+                            offset: Offset::Index(0),
+                            value: vec![0xff, 0xf0],
+                            mask: vec![0xff, 0xf6],
+                            matches: vec![],
+                        },
+                    ],
+                },
+            ),
+            (
+                br#"<magic priority="50">
+                        <match type="little16" value="0603" offset="0">
+                            <match type="little16" mask="030000" value="020000" offset="22"/>
+                        </match>
+                    </magic>"#,
+                Magic {
+                    priority: 50,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: vec![0x83, 0x01],
+                        mask: vec![],
+                        matches: vec![Match {
+                            offset: Offset::Index(22),
+                            value: vec![0x00, 0x20],
+                            mask: vec![0x00, 0x30],
+                            matches: vec![],
+                        }],
+                    }],
+                },
+            ),
+            (
+                br#"<magic priority="50">
+                        <match type="host32" value="0xa1b2c3d4" offset="0"/>
+                        <match type="host32" value="0xd4c3b2a1" offset="0"/>
+                    </magic>"#,
+                Magic {
+                    priority: 50,
+                    matches: vec![
+                        Match {
+                            offset: Offset::Index(0),
+                            value: 0xa1b2_c3d4u32.to_ne_bytes().to_vec(),
+                            mask: vec![],
+                            matches: vec![],
+                        },
+                        Match {
+                            offset: Offset::Index(0),
+                            value: 0xd4c3_b2a1u32.to_ne_bytes().to_vec(),
+                            mask: vec![],
+                            matches: vec![],
+                        },
+                    ],
+                },
+            ),
+            (
+                br#"<magic priority="60">
+                        <match type="host16" value="0143561" offset="0"/>
+                    </magic>"#,
+                Magic {
+                    priority: 60,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: 0o143_561u16.to_ne_bytes().to_vec(),
+                        mask: vec![],
+                        matches: vec![],
+                    }],
+                },
+            ),
+            (
+                br#"<magic priority="50"><match type="string"
+                mask="0xffffffffffffffffffffffff0000000000000000ffffffff"
+                value="\x00\x00\x00\x0c\x6a\x50\x20\x20\x0d\x0a\x87\x0a        jpx\x20"
+                offset="0"/></magic>"#,
+                Magic {
+                    priority: 50,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: vec![
+                            0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50, 0x20, 0x20, 0x0d, 0x0a, 0x87, 0x0a,
+                            0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x6a, 0x70, 0x78, 0x20,
+                        ],
+                        mask: vec![
+                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+                        ],
+                        matches: vec![],
+                    }],
+                },
+            ),
+            (
+                br#"<magic priority="40">
+                        <match type="string" value="\177ELF" offset="0">
+                            <match type="byte" value="2" offset="5">
+                                <match type="big16" value="2" offset="16"/>
+                            </match>
+                        </match>
+                    </magic>"#,
+                Magic {
+                    priority: 40,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: vec![0x7f, 0x45, 0x4c, 0x46],
+                        mask: vec![],
+                        matches: vec![Match {
+                            offset: Offset::Index(5),
+                            value: vec![0x02],
+                            mask: vec![],
+                            matches: vec![Match {
+                                offset: Offset::Index(16),
+                                value: vec![0x00, 0x02],
+                                mask: vec![],
+                                matches: vec![],
+                            }],
+                        }],
+                    }],
+                },
+            ),
+            (
+                br#"<magic priority="50">
+                        <match type="string" value="!&lt;arch&gt;" offset="0">
+                            <match type="string" value="debian" offset="8"/>
+                        </match>
+                    </magic>"#,
+                Magic {
+                    priority: 50,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: b"!<arch>".to_vec(),
+                        mask: vec![],
+                        matches: vec![Match {
+                            offset: Offset::Index(8),
+                            value: b"debian".to_vec(),
+                            mask: vec![],
+                            matches: vec![],
+                        }],
+                    }],
+                },
+            ),
+            (
+                br#"<magic priority="70">
+                        <match type="string" value="PK\003\004" offset="0">
+                            <!-- Comment Comment Comment <Comment> "Comment" -->
+                            <match type="string" value=".fb2" offset="30:256"/>
+                        </match>
+                    </magic>"#,
+                Magic {
+                    priority: 70,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: b"PK\x03\x04".to_vec(),
+                        mask: vec![],
+                        matches: vec![Match {
+                            offset: Offset::Range(30..=256),
+                            value: b".fb2".to_vec(),
+                            mask: vec![],
+                            matches: vec![],
+                        }],
+                    }],
+                },
+            ),
+        ];
+
+        for test in tests.iter() {
+            let reader = &mut Reader::from_reader(test.0);
+            reader.trim_text(true);
+            let magic = match reader.read_event(&mut Vec::new()).unwrap() {
+                Event::Start(e) => Magic::from_xml(reader, e.attributes()).unwrap(),
+                event => panic!("expected Event::Start, found {:?}", event),
+            };
+            assert_eq!(magic, test.1);
+        }
+    }
+
+    #[test]
+    fn parse_mime_type() {
+        let (test, expected) = (
+            br#"<mime-type type="image/x-pict">
+                        <comment>Macintosh Quickdraw/PICT drawing</comment>
+                        <magic priority="50">
+                            <match type="big16" value="0x0011" offset="10">
+                                <match type="big16" value="0x02FF" offset="12">
+                                    <match type="big16" value="0x0C00" offset="14">
+                                        <match type="big16" value="0xFFFE" offset="16"/>
+                                    </match>
+                                </match>
+                            </match>
+                        </magic>
+                        <magic priority="50">
+                            <match type="big16" value="0x0011" offset="522">
+                                <match type="big16" value="0x02FF" offset="524">
+                                    <match type="big16" value="0x0C00" offset="526">
+                                        <match type="big16" value="0xFFFE" offset="528"/>
+                                    </match>
+                                </match>
+                            </match>
+                        </magic>
+                        <glob pattern="*.pct"/>
+                        <glob pattern="*.pict"/>
+                        <glob pattern="*.pict1"/>
+                        <glob pattern="*.pict2"/>
+                    </mime-type>"#
+                .as_ref(),
+            Entry {
+                mime_type: MimeType { value: "image/x-pict".into(), sep: 5 },
+                comment: "Macintosh Quickdraw/PICT drawing".into(),
+                acronym: None,
+                expanded_acronym: None,
+                icon: None,
+                generic_icon: GenericIcon::None,
+                globs: vec![
+                    Glob { pattern: "*.pct".into(), weight: 50, case_sensitive: false },
+                    Glob { pattern: "*.pict".into(), weight: 50, case_sensitive: false },
+                    Glob { pattern: "*.pict1".into(), weight: 50, case_sensitive: false },
+                    Glob { pattern: "*.pict2".into(), weight: 50, case_sensitive: false },
+                ],
+                magics: vec![
+                    Magic {
+                        priority: 50,
+                        matches: vec![Match {
+                            offset: Offset::Index(10),
+                            value: vec![0, 17],
+                            mask: vec![],
+                            matches: vec![Match {
+                                offset: Offset::Index(12),
+                                value: vec![2, 255],
+                                mask: vec![],
+                                matches: vec![Match {
+                                    offset: Offset::Index(14),
+                                    value: vec![12, 0],
+                                    mask: vec![],
+                                    matches: vec![Match {
+                                        offset: Offset::Index(16),
+                                        value: vec![255, 254],
+                                        mask: vec![],
+                                        matches: vec![],
+                                    }],
+                                }],
+                            }],
+                        }],
+                    },
+                    Magic {
+                        priority: 50,
+                        matches: vec![Match {
+                            offset: Offset::Index(522),
+                            value: vec![0, 17],
+                            mask: vec![],
+                            matches: vec![Match {
+                                offset: Offset::Index(524),
+                                value: vec![2, 255],
+                                mask: vec![],
+                                matches: vec![Match {
+                                    offset: Offset::Index(526),
+                                    value: vec![12, 0],
+                                    mask: vec![],
+                                    matches: vec![Match {
+                                        offset: Offset::Index(528),
+                                        value: vec![255, 254],
+                                        mask: vec![],
+                                        matches: vec![],
+                                    }],
+                                }],
+                            }],
+                        }],
+                    },
+                ],
+                tree_magics: vec![],
+                root_xmls: vec![],
+                aliases: vec![],
+                sub_class_of: vec![],
+            },
+        );
+        let reader = &mut Reader::from_reader(test);
+        reader.trim_text(true);
+        let entry = match reader.read_event(&mut Vec::new()).unwrap() {
+            Event::Start(e) => Entry::from_xml(reader, e.attributes()).unwrap(),
+            event => panic!("expected Event::Start, found {:?}", event),
+        };
+        assert_eq!(entry, expected);
     }
 }
