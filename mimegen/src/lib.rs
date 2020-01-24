@@ -4,8 +4,12 @@ use quick_xml::{
     events::{attributes::Attributes, Event},
     Reader,
 };
-use std::convert::{TryFrom, TryInto};
-use std::{cmp::Ordering, io::BufRead, ops::RangeInclusive};
+use std::{
+    cmp::Ordering,
+    convert::{TryFrom, TryInto},
+    io::BufRead,
+    ops::RangeInclusive,
+};
 
 pub mod error;
 
@@ -207,10 +211,13 @@ impl Match {
     fn parse_values(r#type: &str, value: &str, mask: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
         let (w, le) = match r#type {
             "string" => {
-                return Ok((
-                    unescape(&value),
-                    if let Some(s) = mask { hex_to_bytes(s)? } else { vec![] },
-                ));
+                let value = unescape(&value);
+                let mask = if let Some(s) = mask { hex_to_bytes(s)? } else { vec![] };
+                return if !value.is_empty() && (mask.is_empty() || mask.len() == value.len()) {
+                    Ok((value, mask))
+                } else {
+                    Err(Error::InvalidValue)
+                };
             }
             "big16" => (2, false),
             "big32" => (4, false),
@@ -226,6 +233,44 @@ impl Match {
             value_to_vec(&value, w, le)?,
             if let Some(s) = mask { value_to_vec(&s, w, le)? } else { vec![] },
         ))
+    }
+
+    fn unmask(offset: usize, value: Vec<u8>, mask: Vec<u8>, mut matches: Vec<Self>) -> Self {
+        let mut prev = value.len() - 1;
+        for (i, &m) in mask.iter().enumerate().rev() {
+            match (m, mask[prev]) {
+                (0xff, 0xff) => {}
+                (_, 0x00) => prev = i,
+                (_, 0xff) => {
+                    matches = vec![Self {
+                        offset: Offset::Index(offset + i + 1),
+                        value: value[i + 1..=prev].to_vec(),
+                        mask: vec![],
+                        matches,
+                    }];
+                    prev = i
+                }
+                (0xff, _) | (0x00, _) => {
+                    matches = vec![Self {
+                        offset: Offset::Index(offset + i + 1),
+                        value: value[i + 1..=prev].to_vec(),
+                        mask: mask[i + 1..=prev].to_vec(),
+                        matches,
+                    }];
+                    prev = i
+                }
+                _ => {}
+            }
+        }
+        match mask[0] {
+            0x00 => matches.into_iter().next().unwrap(),
+            m => Self {
+                offset: Offset::Index(offset),
+                value: value[..=prev].to_vec(),
+                mask: if m == 0xff { vec![] } else { mask[..=prev].to_vec() },
+                matches,
+            },
+        }
     }
 
     fn inner_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Vec<Self>> {
@@ -293,7 +338,11 @@ impl Match {
 
         let matches = if empty { vec![] } else { Self::inner_xml(reader)? };
 
-        Ok(Self { offset, value, mask, matches })
+        match (&offset, mask.is_empty()) {
+            (Offset::Index(idx), false) => Ok(Self::unmask(*idx, value, mask, matches)),
+            (Offset::Range(_), _) => Ok(Self { offset, value, mask: vec![], matches }),
+            (Offset::Index(_), true) => Ok(Self { offset, value, mask, matches }),
+        }
     }
 }
 
@@ -661,9 +710,14 @@ mod tests {
                     priority: 60,
                     matches: vec![Match {
                         offset: Offset::Index(0),
-                        value: vec![0x1a, 0x08, 0x00, 0x00],
-                        mask: vec![0xff, 0xff, 0x80, 0x80],
-                        matches: vec![],
+                        value: vec![0x1a, 0x08],
+                        mask: vec![],
+                        matches: vec![Match {
+                            offset: Offset::Index(2),
+                            value: vec![0x00, 0x00],
+                            mask: vec![0x80, 0x80],
+                            matches: vec![],
+                        }],
                     }],
                 },
             ),
@@ -683,9 +737,14 @@ mod tests {
                         },
                         Match {
                             offset: Offset::Index(0),
-                            value: vec![0xff, 0xf0],
-                            mask: vec![0xff, 0xf6],
-                            matches: vec![],
+                            value: vec![0xff],
+                            mask: vec![],
+                            matches: vec![Match {
+                                offset: Offset::Index(1),
+                                value: vec![0xf0],
+                                mask: vec![0xf6],
+                                matches: vec![],
+                            }],
                         },
                     ],
                 },
@@ -703,9 +762,9 @@ mod tests {
                         value: vec![0x83, 0x01],
                         mask: vec![],
                         matches: vec![Match {
-                            offset: Offset::Index(22),
-                            value: vec![0x00, 0x20],
-                            mask: vec![0x00, 0x30],
+                            offset: Offset::Index(23),
+                            value: vec![0x20],
+                            mask: vec![0x30],
                             matches: vec![],
                         }],
                     }],
@@ -759,13 +818,14 @@ mod tests {
                         offset: Offset::Index(0),
                         value: vec![
                             0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50, 0x20, 0x20, 0x0d, 0x0a, 0x87, 0x0a,
-                            0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x6a, 0x70, 0x78, 0x20,
                         ],
-                        mask: vec![
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-                        ],
-                        matches: vec![],
+                        mask: vec![],
+                        matches: vec![Match {
+                            offset: Offset::Index(20),
+                            value: vec![0x6a, 0x70, 0x78, 0x20],
+                            mask: vec![],
+                            matches: vec![],
+                        }],
                     }],
                 },
             ),
