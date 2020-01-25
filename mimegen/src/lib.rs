@@ -1,4 +1,3 @@
-use crate::error::Error::MissingElem;
 use error::{Error, Result};
 use quick_xml::{
     events::{attributes::Attributes, Event},
@@ -6,7 +5,9 @@ use quick_xml::{
 };
 use std::{
     cmp::Ordering,
+    collections::{hash_map::Entry as HMEntry, HashMap},
     convert::{TryFrom, TryInto},
+    hash::{Hash, Hasher},
     io::BufRead,
     ops::RangeInclusive,
 };
@@ -112,6 +113,41 @@ fn value_to_vec(s: &str, w: usize, le: bool) -> Result<Vec<u8>> {
     })
 }
 
+fn parse_values(r#type: &str, value: &str, mask: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (w, le) = match r#type {
+        "string" => {
+            let value = unescape(&value);
+            let mask = if let Some(s) = mask { hex_to_bytes(s)? } else { vec![] };
+            return if !value.is_empty() && (mask.is_empty() || mask.len() == value.len()) {
+                Ok((value, mask))
+            } else {
+                Err(Error::InvalidValue)
+            };
+        }
+        "big16" => (2, false),
+        "big32" => (4, false),
+        "little16" => (2, true),
+        "little32" => (4, true),
+        "host16" => (2, cfg!(target_endian = "little")),
+        "host32" => (4, cfg!(target_endian = "little")),
+        "byte" => (1, false),
+        _ => return Err(Error::InvalidMatchType),
+    };
+
+    Ok((
+        value_to_vec(&value, w, le)?,
+        if let Some(s) = mask { value_to_vec(&s, w, le)? } else { vec![] },
+    ))
+}
+
+fn unsorted_union<T: PartialEq>(curr: &mut Vec<T>, other: Vec<T>) {
+    for val in other {
+        if !curr.iter().any(|c| c == &val) {
+            curr.push(val);
+        }
+    }
+}
+
 fn extract_single_attr<R: BufRead>(
     reader: &mut Reader<R>,
     mut attributes: Attributes,
@@ -138,7 +174,7 @@ fn extract_priority<R: BufRead>(reader: &mut Reader<R>, attributes: Attributes) 
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Eq)]
 pub struct MimeType {
     value: String,
     sep: usize,
@@ -154,11 +190,28 @@ impl MimeType {
     }
 }
 
+impl PartialEq for MimeType {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Hash for MimeType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
 impl TryFrom<String> for MimeType {
     type Error = Error;
     fn try_from(s: String) -> Result<Self> {
         match s.as_bytes().iter().position(|&b| b == b'/') {
-            Some(sep) => Ok(Self { value: s, sep }),
+            Some(sep) => match &s[..sep] {
+                "all" | "uri" | "print" | "text" | "application" | "image" | "audio" | "inode"
+                | "video" | "message" | "model" | "multipart" | "x-content" | "x-epoc"
+                | "x-scheme-handler" | "font" => Ok(Self { value: s, sep }),
+                _ => Err(Error::InvalidType(s)),
+            },
             None => Err(Error::InvalidType(s)),
         }
     }
@@ -193,84 +246,62 @@ impl Glob {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum Offset {
+#[derive(Debug, PartialEq, Clone)]
+pub enum Offset {
     Index(usize),
     Range(RangeInclusive<usize>),
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Match {
-    offset: Offset,
-    value: Vec<u8>,
+    pub offset: Offset,
+    pub value: Vec<u8>,
     mask: Vec<u8>,
     matches: Vec<Match>,
 }
 
 impl Match {
-    fn parse_values(r#type: &str, value: &str, mask: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
-        let (w, le) = match r#type {
-            "string" => {
-                let value = unescape(&value);
-                let mask = if let Some(s) = mask { hex_to_bytes(s)? } else { vec![] };
-                return if !value.is_empty() && (mask.is_empty() || mask.len() == value.len()) {
-                    Ok((value, mask))
-                } else {
-                    Err(Error::InvalidValue)
-                };
-            }
-            "big16" => (2, false),
-            "big32" => (4, false),
-            "little16" => (2, true),
-            "little32" => (4, true),
-            "host16" => (2, cfg!(target_endian = "little")),
-            "host32" => (4, cfg!(target_endian = "little")),
-            "byte" => (1, false),
-            _ => return Err(Error::InvalidMatchType),
-        };
-
-        Ok((
-            value_to_vec(&value, w, le)?,
-            if let Some(s) = mask { value_to_vec(&s, w, le)? } else { vec![] },
-        ))
-    }
-
-    fn unmask(offset: usize, value: Vec<u8>, mask: Vec<u8>, mut matches: Vec<Self>) -> Self {
-        let mut prev = value.len() - 1;
-        for (i, &m) in mask.iter().enumerate().rev() {
+    fn unmask(offset: usize, value: Vec<u8>, mask: Vec<u8>, matches: Vec<Self>) -> Self {
+        let mut prev = 0;
+        let mut dummy = vec![];
+        let mut r = &mut dummy;
+        for (i, &m) in mask.iter().enumerate() {
             match (m, mask[prev]) {
                 (0xff, 0xff) => {}
                 (_, 0x00) => prev = i,
                 (_, 0xff) => {
-                    matches = vec![Self {
-                        offset: Offset::Index(offset + i + 1),
-                        value: value[i + 1..=prev].to_vec(),
+                    r.push(Self {
+                        offset: Offset::Index(offset + prev),
+                        value: value[prev..i].to_vec(),
                         mask: vec![],
-                        matches,
-                    }];
+                        matches: vec![],
+                    });
+                    r = &mut r[0].matches;
                     prev = i
                 }
                 (0xff, _) | (0x00, _) => {
-                    matches = vec![Self {
-                        offset: Offset::Index(offset + i + 1),
-                        value: value[i + 1..=prev].to_vec(),
-                        mask: mask[i + 1..=prev].to_vec(),
-                        matches,
-                    }];
+                    r.push(Self {
+                        offset: Offset::Index(offset + prev),
+                        value: value[prev..i].to_vec(),
+                        mask: mask[prev..i].to_vec(),
+                        matches: vec![],
+                    });
+                    r = &mut r[0].matches;
                     prev = i
                 }
                 _ => {}
             }
         }
-        match mask[0] {
-            0x00 => matches.into_iter().next().unwrap(),
-            m => Self {
-                offset: Offset::Index(offset),
-                value: value[..=prev].to_vec(),
-                mask: if m == 0xff { vec![] } else { mask[..=prev].to_vec() },
+        match mask[prev] {
+            0x00 => *r = matches,
+            m => r.push(Self {
+                offset: Offset::Index(offset + prev),
+                value: value[prev..].to_vec(),
+                mask: if m == 0xff { vec![] } else { mask[prev..].to_vec() },
                 matches,
-            },
+            }),
         }
+        dummy.remove(0)
     }
 
     fn inner_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Vec<Self>> {
@@ -334,7 +365,10 @@ impl Match {
         let r#type = r#type.ok_or(Error::MissingAttr { attr: "type", elem: "match" })?;
         let value = value.ok_or(Error::MissingAttr { attr: "value", elem: "match" })?;
 
-        let (value, mask) = Self::parse_values(&r#type, &value, mask.as_deref())?;
+        let (value, mask) = parse_values(&r#type, &value, mask.as_deref())?;
+        if !mask.is_empty() && mask.iter().all(|&v| v == 0x00) {
+            return Err(Error::InvalidValue);
+        }
 
         let matches = if empty { vec![] } else { Self::inner_xml(reader)? };
 
@@ -344,21 +378,53 @@ impl Match {
             (Offset::Index(_), true) => Ok(Self { offset, value, mask, matches }),
         }
     }
+
+    //noinspection RsBorrowChecker
+    fn concatenate(matches: Vec<Self>) -> Vec<Self> {
+        let mut result = vec![];
+        for mut m in matches {
+            m.matches = Self::concatenate(m.matches);
+            match (&m.offset, m.mask.is_empty(), m.matches.is_empty()) {
+                (Offset::Index(idx), true, false) => {
+                    let offset = Offset::Index(idx + m.value.len());
+                    let mut invalid = vec![];
+                    for mm in m.matches {
+                        if mm.offset == offset && mm.mask.is_empty() {
+                            result.push(Self {
+                                offset: m.offset.clone(),
+                                value: [&m.value[..], &mm.value[..]].concat(),
+                                mask: vec![],
+                                matches: mm.matches,
+                            })
+                        } else {
+                            invalid.push(mm);
+                        }
+                    }
+                    if !invalid.is_empty() {
+                        m.matches = invalid;
+                        result.push(m);
+                    }
+                }
+                _ => result.push(m),
+            }
+        }
+        result
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Magic {
     priority: u8,
-    matches: Vec<Match>,
+    pub matches: Vec<Match>,
 }
 
 impl Magic {
     fn from_xml<R: BufRead>(reader: &mut Reader<R>, attributes: Attributes) -> Result<Self> {
         let priority = extract_priority(reader, attributes)?;
-        let matches = Match::inner_xml(reader)?;
+        let matches = Match::concatenate(Match::inner_xml(reader)?);
 
         if matches.is_empty() {
-            Err(MissingElem { top: "magic", sub: "match" })
+            Err(Error::MissingElem { top: "magic", sub: "match" })
         } else {
             Ok(Self { priority, matches })
         }
@@ -464,7 +530,7 @@ impl TreeMagic {
         let matches = TreeMatch::inner_xml(reader)?;
 
         if matches.is_empty() {
-            Err(MissingElem { top: "treemagic", sub: "treematch" })
+            Err(Error::MissingElem { top: "treemagic", sub: "treematch" })
         } else {
             Ok(Self { priority, matches })
         }
@@ -608,9 +674,13 @@ impl Entry {
                     }
                     b"glob" => globs.push(Glob::from_xml(reader, e.attributes())?),
                     b"root-XML" => root_xmls.push(RootXML::from_xml(reader, e.attributes())?),
-                    b"alias" => aliases.push(
-                        extract_single_attr(reader, e.attributes(), "alias", "type")?.try_into()?,
-                    ),
+                    b"alias" => {
+                        if let Ok(alias) =
+                            extract_single_attr(reader, e.attributes(), "alias", "type")?.try_into()
+                        {
+                            aliases.push(alias)
+                        }
+                    }
                     b"sub-class-of" => sub_class_of.push(
                         extract_single_attr(reader, e.attributes(), "sub-class-of", "type")?
                             .try_into()?,
@@ -639,27 +709,57 @@ impl Entry {
             sub_class_of,
         })
     }
+
+    fn append(&mut self, other: Self) {
+        self.comment = other.comment;
+        if other.acronym != None {
+            self.acronym = other.acronym;
+        }
+        if other.expanded_acronym != None {
+            self.expanded_acronym = other.expanded_acronym;
+        }
+        if other.icon != None {
+            self.icon = other.icon;
+        }
+        if other.generic_icon != GenericIcon::None {
+            self.generic_icon = other.generic_icon;
+        }
+        unsorted_union(&mut self.root_xmls, other.root_xmls);
+        unsorted_union(&mut self.aliases, other.aliases);
+        unsorted_union(&mut self.sub_class_of, other.sub_class_of);
+    }
 }
 
-#[derive(Debug, PartialEq)]
-pub struct MimeInfo(pub Vec<Entry>);
+#[derive(Debug, Default)]
+pub struct MimeInfo(pub HashMap<MimeType, Entry>);
 
 impl MimeInfo {
     pub fn from_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Self> {
-        let mut entries = vec![];
+        let mut entries = Self::default();
+        entries.add_from_xml(reader)?;
+        Ok(entries)
+    }
+
+    pub fn add_from_xml<R: BufRead>(&mut self, reader: &mut Reader<R>) -> Result<&mut Self> {
         let mut buf = vec![];
 
         loop {
             match reader.read_event(&mut buf)? {
                 Event::End(_) => break,
                 Event::Start(e) if e.name() == b"mime-type" => {
-                    entries.push(Entry::from_xml(reader, e.attributes())?)
+                    let entry = Entry::from_xml(reader, e.attributes())?;
+                    match self.0.entry(entry.mime_type.clone()) {
+                        HMEntry::Occupied(mut e) => e.get_mut().append(entry),
+                        HMEntry::Vacant(e) => {
+                            e.insert(entry);
+                        }
+                    }
                 }
                 _ => {}
             }
             buf.clear();
         }
-        Ok(Self(entries))
+        Ok(self)
     }
 }
 
@@ -900,6 +1000,43 @@ mod tests {
                     }],
                 },
             ),
+            (
+                br#"<magic priority="70">
+                        <match type="string" value="PK\003\004" offset="0">
+                            <match type="string" value="mimetype" offset="30">
+                                <match type="string" value="application/epub+zip" offset="38"/>
+                                <match type="string" value="application/epub+zip" offset="43"/>
+                            </match>
+                        </match>
+                    </magic>"#,
+                Magic {
+                    priority: 70,
+                    matches: vec![Match {
+                        offset: Offset::Index(0),
+                        value: b"PK\x03\x04".to_vec(),
+                        mask: vec![],
+                        matches: vec![
+                            Match {
+                                offset: Offset::Index(30),
+                                value: b"mimetypeapplication/epub+zip".to_vec(),
+                                mask: vec![],
+                                matches: vec![],
+                            },
+                            Match {
+                                offset: Offset::Index(30),
+                                value: b"mimetype".to_vec(),
+                                mask: vec![],
+                                matches: vec![Match {
+                                    offset: Offset::Index(43),
+                                    value: b"application/epub+zip".to_vec(),
+                                    mask: vec![],
+                                    matches: vec![],
+                                }],
+                            },
+                        ],
+                    }],
+                },
+            ),
         ];
 
         for test in tests.iter() {
@@ -960,48 +1097,18 @@ mod tests {
                         priority: 50,
                         matches: vec![Match {
                             offset: Offset::Index(10),
-                            value: vec![0, 17],
+                            value: vec![0, 17, 2, 255, 12, 0, 255, 254],
                             mask: vec![],
-                            matches: vec![Match {
-                                offset: Offset::Index(12),
-                                value: vec![2, 255],
-                                mask: vec![],
-                                matches: vec![Match {
-                                    offset: Offset::Index(14),
-                                    value: vec![12, 0],
-                                    mask: vec![],
-                                    matches: vec![Match {
-                                        offset: Offset::Index(16),
-                                        value: vec![255, 254],
-                                        mask: vec![],
-                                        matches: vec![],
-                                    }],
-                                }],
-                            }],
+                            matches: vec![],
                         }],
                     },
                     Magic {
                         priority: 50,
                         matches: vec![Match {
                             offset: Offset::Index(522),
-                            value: vec![0, 17],
+                            value: vec![0, 17, 2, 255, 12, 0, 255, 254],
                             mask: vec![],
-                            matches: vec![Match {
-                                offset: Offset::Index(524),
-                                value: vec![2, 255],
-                                mask: vec![],
-                                matches: vec![Match {
-                                    offset: Offset::Index(526),
-                                    value: vec![12, 0],
-                                    mask: vec![],
-                                    matches: vec![Match {
-                                        offset: Offset::Index(528),
-                                        value: vec![255, 254],
-                                        mask: vec![],
-                                        matches: vec![],
-                                    }],
-                                }],
-                            }],
+                            matches: vec![],
                         }],
                     },
                 ],
