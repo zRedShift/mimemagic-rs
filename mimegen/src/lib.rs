@@ -7,9 +7,11 @@ use std::{
     cmp::Ordering,
     collections::{hash_map::Entry as HMEntry, HashMap},
     convert::{TryFrom, TryInto},
+    fs,
     hash::{Hash, Hasher},
     io::BufRead,
     ops::RangeInclusive,
+    path::{Path, PathBuf},
 };
 
 pub mod error;
@@ -624,13 +626,16 @@ pub struct Entry {
     root_xmls: Vec<RootXML>,
     pub aliases: Vec<MimeType>,
     pub sub_class_of: Vec<MimeType>,
+    glob_delete_all: bool,
+    magic_delete_all: bool,
 }
 
 impl Entry {
     fn from_xml<R: BufRead>(reader: &mut Reader<R>, attributes: Attributes) -> Result<Self> {
         let mime_type = extract_single_attr(reader, attributes, "mime-type", "type")?.try_into()?;
-        let mut buf = vec![];
-        let mut comment = None;
+        let buf = &mut vec![];
+        let skip_buf = &mut vec![];
+        let mut comment = String::new();
         let mut acronym = None;
         let mut expanded_acronym = None;
         let mut icon = None;
@@ -641,24 +646,28 @@ impl Entry {
         let mut root_xmls = vec![];
         let mut aliases = vec![];
         let mut sub_class_of = vec![];
+        let mut glob_delete_all = false;
+        let mut magic_delete_all = false;
 
         loop {
-            match reader.read_event(&mut buf)? {
+            match reader.read_event(buf)? {
                 Event::Start(e) => match e.name() {
-                    b"comment" if comment == None && e.attributes().next().is_none() => {
-                        comment = Some(reader.read_text(e.name(), &mut vec![])?)
+                    b"comment" | b"_comment"
+                        if comment.is_empty() && e.attributes().next().is_none() =>
+                    {
+                        comment = reader.read_text(e.name(), skip_buf)?
                     }
                     b"acronym" if acronym == None && e.attributes().next().is_none() => {
-                        acronym = Some(reader.read_text(e.name(), &mut vec![])?)
+                        acronym = Some(reader.read_text(e.name(), skip_buf)?)
                     }
                     b"expanded-acronym"
                         if expanded_acronym == None && e.attributes().next().is_none() =>
                     {
-                        expanded_acronym = Some(reader.read_text(e.name(), &mut vec![])?)
+                        expanded_acronym = Some(reader.read_text(e.name(), skip_buf)?)
                     }
                     b"magic" => magics.push(Magic::from_xml(reader, e.attributes())?),
                     b"treemagic" => tree_magics.push(TreeMagic::from_xml(reader, e.attributes())?),
-                    _ => {}
+                    _ => reader.read_to_end(e.name(), skip_buf)?,
                 },
                 Event::Empty(e) => match e.name() {
                     b"icon" => {
@@ -685,15 +694,18 @@ impl Entry {
                         extract_single_attr(reader, e.attributes(), "sub-class-of", "type")?
                             .try_into()?,
                     ),
+                    b"glob-deleteall" => glob_delete_all = true,
+                    b"magic-deleteall" => magic_delete_all = true,
+
                     _ => {}
                 },
                 Event::End(_) => break,
                 _ => {}
             }
             buf.clear();
+            skip_buf.clear();
         }
 
-        let comment = comment.ok_or(Error::MissingElem { top: "mime-type", sub: "comment" })?;
         Ok(Entry {
             mime_type,
             comment,
@@ -707,11 +719,15 @@ impl Entry {
             root_xmls,
             aliases,
             sub_class_of,
+            glob_delete_all,
+            magic_delete_all,
         })
     }
 
     fn append(&mut self, other: Self) {
-        self.comment = other.comment;
+        if !other.comment.is_empty() {
+            self.comment = other.comment;
+        }
         if other.acronym != None {
             self.acronym = other.acronym;
         }
@@ -727,6 +743,43 @@ impl Entry {
         unsorted_union(&mut self.root_xmls, other.root_xmls);
         unsorted_union(&mut self.aliases, other.aliases);
         unsorted_union(&mut self.sub_class_of, other.sub_class_of);
+        if other.glob_delete_all {
+            self.globs = other.globs;
+        } else {
+            for glob in other.globs {
+                match self
+                    .globs
+                    .iter_mut()
+                    // TODO case insensitive pattern comparison
+                    .find(|g| g.case_sensitive == glob.case_sensitive && g.pattern == glob.pattern)
+                {
+                    Some(g) => g.weight = glob.weight,
+                    None => self.globs.push(glob),
+                }
+            }
+        }
+        if other.magic_delete_all {
+            self.magics = other.magics;
+        } else {
+            for magic in other.magics {
+                match self.magics.iter_mut().find(|m| m.matches == magic.matches) {
+                    Some(m) => m.priority = magic.priority,
+                    None => match self.magics.iter_mut().find(|m| m.priority == magic.priority) {
+                        Some(m) => unsorted_union(&mut m.matches, magic.matches),
+                        None => self.magics.push(magic),
+                    },
+                }
+            }
+        }
+        for tree in other.tree_magics {
+            match self.tree_magics.iter_mut().find(|t| t.matches == tree.matches) {
+                Some(t) => t.priority = tree.priority,
+                None => match self.tree_magics.iter_mut().find(|t| t.priority == tree.priority) {
+                    Some(t) => unsorted_union(&mut t.matches, tree.matches),
+                    None => self.tree_magics.push(tree),
+                },
+            }
+        }
     }
 }
 
@@ -734,15 +787,8 @@ impl Entry {
 pub struct MimeInfo(pub HashMap<MimeType, Entry>);
 
 impl MimeInfo {
-    pub fn from_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Self> {
-        let mut entries = Self::default();
-        entries.add_from_xml(reader)?;
-        Ok(entries)
-    }
-
-    pub fn add_from_xml<R: BufRead>(&mut self, reader: &mut Reader<R>) -> Result<&mut Self> {
+    pub fn add_from_xml<R: BufRead>(&mut self, reader: &mut Reader<R>) -> Result<()> {
         let mut buf = vec![];
-
         loop {
             match reader.read_event(&mut buf)? {
                 Event::End(_) => break,
@@ -759,7 +805,51 @@ impl MimeInfo {
             }
             buf.clear();
         }
-        Ok(self)
+        Ok(())
+    }
+
+    pub fn add_from_dir<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
+        let mut override_xml = None;
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+            .filter_map(|res| match res {
+                Err(e) => Some(Err(Error::Io(e))),
+                Ok(entry) => {
+                    let path = entry.path();
+                    if !path.is_file() || path.extension() != Some("xml".as_ref()) {
+                        None
+                    } else if path.file_name().unwrap() == "Override.xml" {
+                        override_xml = Some(path);
+                        None
+                    } else {
+                        Some(Ok(path))
+                    }
+                }
+            })
+            .collect::<Result<_>>()?;
+        paths.sort();
+        if let Some(path) = override_xml {
+            paths.push(path)
+        }
+        for path in paths {
+            let reader = &mut Reader::from_file(path)?;
+            reader.trim_text(true);
+            self.add_from_xml(reader)?;
+        }
+        Ok(())
+    }
+
+    pub fn from_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Self> {
+        let mut entries = Self::default();
+        entries.add_from_xml(reader)?;
+        Ok(entries)
+    }
+
+    pub fn from_dirs<P: AsRef<Path>>(dirs: &[P]) -> Result<Self> {
+        let mut entries = Self::default();
+        for dir in dirs {
+            entries.add_from_dir(dir)?;
+        }
+        Ok(entries)
     }
 }
 
@@ -1116,6 +1206,8 @@ mod tests {
                 root_xmls: vec![],
                 aliases: vec![],
                 sub_class_of: vec![],
+                glob_delete_all: false,
+                magic_delete_all: false,
             },
         );
         let reader = &mut Reader::from_reader(test);
