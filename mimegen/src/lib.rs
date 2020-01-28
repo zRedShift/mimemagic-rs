@@ -5,7 +5,7 @@ use quick_xml::{
 };
 use std::{
     cmp::Ordering,
-    collections::{hash_map::Entry as HMEntry, HashMap},
+    collections::HashMap,
     convert::{TryFrom, TryInto},
     fs,
     hash::{Hash, Hasher},
@@ -243,7 +243,11 @@ impl Glob {
                 _ => {}
             };
         }
-        let pattern = pattern.ok_or(Error::MissingAttr { attr: "pattern", elem: "glob" })?;
+        let pattern = match pattern {
+            Some(pattern) if !case_sensitive => pattern.to_ascii_lowercase(),
+            Some(pattern) => pattern,
+            _ => return Err(Error::MissingAttr { attr: "pattern", elem: "glob" }),
+        };
         Ok(Self { pattern, weight, case_sensitive })
     }
 }
@@ -612,9 +616,14 @@ impl GenericIcon {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl Default for GenericIcon {
+    fn default() -> Self {
+        GenericIcon::None
+    }
+}
+
+#[derive(Debug, PartialEq, Default)]
 pub struct Entry {
-    pub mime_type: MimeType,
     comment: String,
     acronym: Option<String>,
     expanded_acronym: Option<String>,
@@ -631,8 +640,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn from_xml<R: BufRead>(reader: &mut Reader<R>, attributes: Attributes) -> Result<Self> {
-        let mime_type = extract_single_attr(reader, attributes, "mime-type", "type")?.try_into()?;
+    fn from_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Self> {
         let buf = &mut vec![];
         let skip_buf = &mut vec![];
         let mut comment = String::new();
@@ -707,7 +715,6 @@ impl Entry {
         }
 
         Ok(Entry {
-            mime_type,
             comment,
             acronym,
             expanded_acronym,
@@ -724,7 +731,7 @@ impl Entry {
         })
     }
 
-    fn append(&mut self, other: Self) {
+    fn combine_with(&mut self, other: Self) {
         if !other.comment.is_empty() {
             self.comment = other.comment;
         }
@@ -747,14 +754,21 @@ impl Entry {
             self.globs = other.globs;
         } else {
             for glob in other.globs {
-                match self
-                    .globs
-                    .iter_mut()
-                    // TODO case insensitive pattern comparison
-                    .find(|g| g.case_sensitive == glob.case_sensitive && g.pattern == glob.pattern)
-                {
-                    Some(g) => g.weight = glob.weight,
+                match self.globs.iter_mut().find_map(|g| {
+                    match (g.case_sensitive == glob.case_sensitive, glob.case_sensitive) {
+                        (true, _) if g.pattern == glob.pattern => Some(Some(g)),
+                        (false, true)
+                            if glob.weight <= g.weight
+                                && g.pattern == glob.pattern.to_ascii_lowercase() =>
+                        {
+                            Some(None)
+                        }
+                        _ => None,
+                    }
+                }) {
+                    Some(Some(g)) => g.weight = glob.weight,
                     None => self.globs.push(glob),
+                    _ => {}
                 }
             }
         }
@@ -793,18 +807,22 @@ impl MimeInfo {
             match reader.read_event(&mut buf)? {
                 Event::End(_) => break,
                 Event::Start(e) if e.name() == b"mime-type" => {
-                    let entry = Entry::from_xml(reader, e.attributes())?;
-                    match self.0.entry(entry.mime_type.clone()) {
-                        HMEntry::Occupied(mut e) => e.get_mut().append(entry),
-                        HMEntry::Vacant(e) => {
-                            e.insert(entry);
-                        }
-                    }
+                    let mime_type =
+                        extract_single_attr(reader, e.attributes(), "mime-type", "type")?
+                            .try_into()?;
+                    self.0.entry(mime_type).or_default().combine_with(Entry::from_xml(reader)?);
                 }
                 _ => {}
             }
             buf.clear();
         }
+        Ok(())
+    }
+
+    pub fn add_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let reader = &mut Reader::from_file(path)?;
+        reader.trim_text(true);
+        self.add_from_xml(reader)?;
         Ok(())
     }
 
@@ -827,13 +845,11 @@ impl MimeInfo {
             })
             .collect::<Result<_>>()?;
         paths.sort();
-        if let Some(path) = override_xml {
-            paths.push(path)
-        }
         for path in paths {
-            let reader = &mut Reader::from_file(path)?;
-            reader.trim_text(true);
-            self.add_from_xml(reader)?;
+            self.add_from_file(path)?;
+        }
+        if let Some(path) = override_xml {
+            self.add_from_file(path)?;
         }
         Ok(())
     }
@@ -841,6 +857,26 @@ impl MimeInfo {
     pub fn from_xml<R: BufRead>(reader: &mut Reader<R>) -> Result<Self> {
         let mut entries = Self::default();
         entries.add_from_xml(reader)?;
+        Ok(entries)
+    }
+
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut entries = Self::default();
+        entries.add_from_file(path)?;
+        Ok(entries)
+    }
+
+    pub fn from_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
+        let mut entries = Self::default();
+        for path in paths {
+            entries.add_from_file(path)?;
+        }
+        Ok(entries)
+    }
+
+    pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        let mut entries = Self::default();
+        entries.add_from_dir(dir)?;
         Ok(entries)
     }
 
@@ -1170,7 +1206,6 @@ mod tests {
                     </mime-type>"#
                 .as_ref(),
             Entry {
-                mime_type: MimeType { value: "image/x-pict".into(), sep: 5 },
                 comment: "Macintosh Quickdraw/PICT drawing".into(),
                 acronym: None,
                 expanded_acronym: None,
@@ -1213,7 +1248,7 @@ mod tests {
         let reader = &mut Reader::from_reader(test);
         reader.trim_text(true);
         let entry = match reader.read_event(&mut Vec::new()).unwrap() {
-            Event::Start(e) => Entry::from_xml(reader, e.attributes()).unwrap(),
+            Event::Start(_) => Entry::from_xml(reader).unwrap(),
             event => panic!("expected Event::Start, found {:?}", event),
         };
         assert_eq!(entry, expected);
