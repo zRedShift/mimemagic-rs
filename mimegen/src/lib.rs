@@ -262,8 +262,8 @@ pub enum Offset {
 pub struct Match {
     pub offset: Offset,
     pub value: Vec<u8>,
-    mask: Vec<u8>,
-    matches: Vec<Match>,
+    pub mask: Vec<u8>,
+    pub matches: Vec<Match>,
 }
 
 impl Match {
@@ -887,6 +887,13 @@ impl MimeInfo {
         }
         Ok(entries)
     }
+
+    //    pub fn process_entries(self) {
+    //        let mut mime_types = Vec::with_capacity(self.0.len());
+    //        for (i, (mime_type, entry)) in self.0.into_iter().enumerate() {
+    //            mime_types.push(mime_type);
+    //        }
+    //    }
 }
 
 #[cfg(test)]
