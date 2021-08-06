@@ -7,4 +7,4 @@ publish = false
 
 
 [dependencies]
-quick-xml = "0.17"
+quick-xml = "0.20"

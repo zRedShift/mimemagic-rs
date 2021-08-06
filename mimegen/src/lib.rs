@@ -10,7 +10,6 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io::BufRead,
-    ops::RangeInclusive,
     path::{Path, PathBuf},
 };
 
@@ -255,7 +254,7 @@ impl Glob {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Offset {
     Index(usize),
-    Range(RangeInclusive<usize>),
+    Range { from: usize, to: usize },
 }
 
 #[derive(Debug, PartialEq)]
@@ -357,7 +356,7 @@ impl Match {
                         Some(Ok(to)) => match to.cmp(&from) {
                             Ordering::Less => return Err(Error::InvalidOffset),
                             Ordering::Equal => Offset::Index(from),
-                            Ordering::Greater => Offset::Range(from..=to),
+                            Ordering::Greater => Offset::Range { from, to },
                         },
                     });
                 }
@@ -380,12 +379,11 @@ impl Match {
 
         match (&offset, mask.is_empty()) {
             (Offset::Index(idx), false) => Ok(Self::unmask(*idx, value, mask, matches)),
-            (Offset::Range(_), _) => Ok(Self { offset, value, mask: vec![], matches }),
+            (Offset::Range { .. }, _) => Ok(Self { offset, value, mask: vec![], matches }),
             (Offset::Index(_), true) => Ok(Self { offset, value, mask, matches }),
         }
     }
 
-    //noinspection RsBorrowChecker
     fn concatenate(matches: Vec<Self>) -> Vec<Self> {
         let mut result = vec![];
         for mut m in matches {
@@ -1125,7 +1123,7 @@ mod tests {
                         value: b"PK\x03\x04".to_vec(),
                         mask: vec![],
                         matches: vec![Match {
-                            offset: Offset::Range(30..=256),
+                            offset: Offset::Range { from: 30, to: 256 },
                             value: b".fb2".to_vec(),
                             mask: vec![],
                             matches: vec![],
